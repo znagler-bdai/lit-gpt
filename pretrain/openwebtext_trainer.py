@@ -7,10 +7,13 @@ from typing import Optional, Any
 import lightning as L
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader, IterableDataset
-from lightning.pytorch.callbacks import ModelCheckpoint
-from lightning.pytorch.loggers import CSVLogger
-from lightning.pytorch.strategies import FSDPStrategy, XLAStrategy
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, DeviceStatsMonitor
+from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger, WandbLogger
+from lightning.pytorch.strategies import FSDPStrategy, XLAStrategy, DeepSpeedStrategy
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from lightning.pytorch.profilers import PyTorchProfiler
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -21,22 +24,37 @@ from lit_gpt.model import GPT, Block
 from lit_gpt.speed_monitor import measure_flops, estimate_flops, SpeedMonitorCallback
 from lit_gpt.utils import step_csv_logger, chunked_cross_entropy
 
-model_name = "pythia-70m"
 name = "openwebtext"
 out_dir = Path("out") / name
 data_dir = Path("data") / name
 save_interval = 1000
-eval_interval = 1000
-eval_iters = 100
 log_interval = 1
 
+
 # Hyperparameters
+train_bin_path = "/home/znagler_theaiinstitute_com/dev/nanoGPT/data/openwebtext/train.bin"
+val_bin_path = "/home/znagler_theaiinstitute_com/dev/nanoGPT/data/openwebtext/val.bin"
+
+max_steps = 1_000
+gradient_accumulation_steps = 1
+batch_size = 4
+
+max_iters = max_steps * gradient_accumulation_steps
+train_params = {
+    "eval_batches": 10,
+    "batch_size": batch_size,
+    "max_steps": max_steps,
+    "gradient_accumulation_steps": gradient_accumulation_steps,
+    "max_iters": max_iters,
+    "total_training_examples": batch_size * max_steps,  # only informational, not used
+    "eval_interval": 100,
+    "lightning_strategy": "ddp",
+    "devices": 4,
+    "precision": "16-mixed",
+}
+
+
 learning_rate = 6e-4
-batch_size = 125
-micro_batch_size = 5
-gradient_accumulation_steps = batch_size // micro_batch_size
-assert gradient_accumulation_steps > 0
-max_iters = 600000  # num_epochs * (epoch_size // micro_batch_size) // devices
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -45,7 +63,12 @@ warmup_iters = 2000
 lr_decay_iters = max_iters
 min_lr = 6e-5
 
-hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
+lr_params = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
+
+# wandb stuff
+wandb_project = "wandb_vm_test"  # Project
+wandb_name = f"batch_size:{batch_size}"  # this will be the wandb run name
+wandb_experiment_name = "batch_size_exp1"  # currently using wandb "tags" for this
 
 
 class LightningGPTModule(L.LightningModule):
@@ -55,23 +78,36 @@ class LightningGPTModule(L.LightningModule):
         self.module: Optional[torch.nn.Module] = None
         self.measured_flops: Optional[int] = None
 
+        self.save_hyperparameters()
+
     def configure_model(self) -> None:
         self.module = GPT(self.config)
         self.module.apply(self.module._init_weights)
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
         return torch.optim.AdamW(
-            self.module.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2), foreach=False
+            self.module.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay,
+            betas=(beta1, beta2),
+            foreach=False,
         )
 
-    def on_fit_start(self) -> None:
+    def print_stats(self):
+        self.print("*" * 100)
+        self.print(
+            f"Running {max_steps} steps of {gradient_accumulation_steps} iters each, totaling \
+            {max_iters} batches.  With batch size {batch_size}.  this covers \
+            {train_params['total_training_examples']} total training examples"
+        )
+        self.print("*" * 100)
         trainer = self.trainer
         with torch.device("meta"):
             meta_model = GPT(self.module.config)
             # estimated is too much of an optimistic estimate, left just for reference
-            estimated_flops = estimate_flops(meta_model) * micro_batch_size
+            estimated_flops = estimate_flops(meta_model) * batch_size
             self.print(f"Estimated TFLOPs: {estimated_flops * trainer.world_size / 1e12:.2f}")
-            x = torch.randint(0, 1, (micro_batch_size, meta_model.config.block_size))
+            x = torch.randint(0, 1, (batch_size, meta_model.config.block_size))
             self.measured_flops = measure_flops(meta_model, x)
             self.print(f"Measured TFLOPs: {self.measured_flops * trainer.world_size / 1e12:.2f}")
 
@@ -86,63 +122,67 @@ class LightningGPTModule(L.LightningModule):
 
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         input_ids, targets = batch
+        if batch_idx == 0:
+            self.print("training input_ids.shape", input_ids.shape, input_ids)
+            self.print("training targets.shape", targets.shape, targets)
+            self.print_stats()
+
         logits = self.module(input_ids)
-        loss = chunked_cross_entropy(logits, targets, chunk_size=0)
+        logits = logits.reshape(-1, logits.size(-1))
+        targets = targets.reshape(-1)
+        # unsure about this custom cross_entropy, would prefer to use standard
+        # loss = chunked_cross_entropy(logits, targets, chunk_size=0)
+        loss = torch.nn.functional.cross_entropy(logits, targets, ignore_index=-1)
         self.log("train_loss", loss, on_step=True, on_epoch=False, prog_bar=True)
+
+        # tracking torch's memory allocated on one GPU for comparison
+        self.log("memory cuda:0", torch.cuda.memory_allocated(torch.device("cuda:0")))
+
         return loss
 
     def validation_step(self, batch: Any, batch_idx: int) -> None:
         input_ids, targets = batch
         logits = self.module(input_ids)
-        loss = chunked_cross_entropy(logits, targets, chunk_size=0)
+        logits = logits.reshape(-1, logits.size(-1))
+        targets = targets.reshape(-1)
+
+        # unsure about this custom cross_entropy, would prefer to use standard
+        # loss = chunked_cross_entropy(logits, targets, chunk_size=0)
+        loss = torch.nn.functional.cross_entropy(logits, targets, ignore_index=-1)
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
 
 
-def main(devices: int = 1, precision: Optional[str] = None, tpu: bool = False) -> None:
-    if precision is None:
-        precision = "32-true" if tpu else "bf16-mixed"
-    if devices > 1:
-        if tpu:
-            # For multi-host TPU training, the device count for Fabric is limited to the count on a single host.
-            devices = "auto"
-            strategy = XLAStrategy(sync_module_states=False)
-        else:
-            strategy = FSDPStrategy(
-                auto_wrap_policy={Block},
-                activation_checkpointing_policy={Block},
-                # the argument is not available in the Trainer strategy, but it's the default anyways
-                # state_dict_type="full",
-                limit_all_gathers=True,
-                cpu_offload=False,
-            )
-    else:
-        strategy = "auto"
+def main(
+    model_name="pythia-70m",
+) -> None:
+    logger = WandbLogger(project=wandb_project, name=wandb_name, tags=[wandb_experiment_name])
 
-    logger = step_csv_logger("out", name, cls=CSVLogger, flush_logs_every_n_steps=log_interval)
-    speed_monitor = SpeedMonitorCallback(
-        length_fn=lambda batch: batch[0].size(1), batch_size=micro_batch_size, window_size=50, time_unit="seconds"
-    )
-    model_checkpoint = ModelCheckpoint(dirpath=out_dir, every_n_train_steps=save_interval, save_last=True, verbose=True)
     trainer = L.Trainer(
-        devices=devices,
-        strategy=strategy,
-        precision=precision,
+        max_steps=max_steps,
+        profiler="simple",
+        devices=train_params["devices"],
+        accelerator="auto",
+        strategy=train_params["lightning_strategy"],
+        precision=train_params["precision"],
         logger=logger,
-        callbacks=[speed_monitor, model_checkpoint],
-        max_steps=max_iters,
+        callbacks=[DeviceStatsMonitor()],
         max_epochs=1,
-        limit_val_batches=eval_iters,
+        limit_val_batches=train_params["eval_batches"],
         accumulate_grad_batches=gradient_accumulation_steps,
         log_every_n_steps=log_interval,
-        val_check_interval=eval_interval,
+        val_check_interval=train_params["eval_interval"],
+        enable_model_summary=True,
     )
 
     L.seed_everything(1337, workers=True)  # same seed for every process to init model (FSDP)
 
-    trainer.print(hparams)
+    trainer.print("Train params", train_params)
+    trainer.print("Learning Rate params", lr_params)
+    trainer.print(f"{trainer.accelerator=} {trainer.strategy=}")
 
     if trainer.global_rank == 0:
         out_dir.mkdir(parents=True, exist_ok=True)
+        logger.experiment.config.update(train_params)  # Makes params show up in the information tab in Wandb
 
     config = Config.from_name(model_name)
     trainer.print(f"Loading model with {config.__dict__}")
@@ -150,11 +190,12 @@ def main(devices: int = 1, precision: Optional[str] = None, tpu: bool = False) -
     model = LightningGPTModule(config)
     trainer.print(f"Time to instantiate model: {time.time() - t0:.02f} seconds.")
 
-    train_data = Dataset(str(data_dir / "train.bin"), config.block_size)
-    val_data = Dataset(str(data_dir / "val.bin"), config.block_size)
-    train_dataloader = DataLoader(train_data, batch_size=micro_batch_size, num_workers=2)
-    val_dataloader = DataLoader(val_data, batch_size=micro_batch_size, num_workers=2)
+    train_data = Dataset(train_bin_path, config.block_size)
+    val_data = Dataset(val_bin_path, config.block_size)
+    train_dataloader = DataLoader(train_data, batch_size=batch_size, num_workers=2)
+    val_dataloader = DataLoader(val_data, batch_size=batch_size, num_workers=2)
 
+    trainer.print("Calling trainer.fit...")
     t0 = time.time()
     trainer.fit(model, train_dataloader, val_dataloader, ckpt_path="last")
     trainer.print(f"Training time: {(time.time()-t0):.2f}s")
