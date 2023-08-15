@@ -14,6 +14,7 @@ from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger, WandbLogger
 from lightning.pytorch.strategies import FSDPStrategy, XLAStrategy, DeepSpeedStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from lightning.pytorch.profilers import PyTorchProfiler
+from deepspeed import ops
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -32,12 +33,26 @@ log_interval = 1
 
 
 # Hyperparameters
-train_bin_path = "/home/znagler_theaiinstitute_com/dev/nanoGPT/data/openwebtext/train.bin"
-val_bin_path = "/home/znagler_theaiinstitute_com/dev/nanoGPT/data/openwebtext/val.bin"
+train_bin_path = "/home/jpatel_theaiinstitute_com/dev/nanoGPT/data/openwebtext/train.bin"
+val_bin_path = "/home/jpatel_theaiinstitute_com/dev/nanoGPT/data/openwebtext/val.bin"
 
 max_steps = 1_000
 gradient_accumulation_steps = 1
 batch_size = 4
+
+ds_dict = {
+    "stage": 3,
+    "offload_optimizer": True,
+    "offload_parameters": True,
+}
+
+ds_offload_summary = "none"
+if ds_dict["offload_optimizer"]:
+    ds_offload_summary = "optimizer"
+if ds_dict["offload_parameters"]:
+    ds_offload_summary = "parameters"
+if ds_dict["offload_optimizer"] and ds_dict["offload_parameters"]:
+    ds_offload_summary = "both"
 
 max_iters = max_steps * gradient_accumulation_steps
 train_params = {
@@ -48,8 +63,9 @@ train_params = {
     "max_iters": max_iters,
     "total_training_examples": batch_size * max_steps,  # only informational, not used
     "eval_interval": 100,
-    "lightning_strategy": "ddp",
-    "devices": 4,
+    "lightning_strategy": DeepSpeedStrategy(**ds_dict),
+    # "lightning_strategy": "ddp",
+    "devices": 8,
     "precision": "16-mixed",
 }
 
@@ -66,9 +82,9 @@ min_lr = 6e-5
 lr_params = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
 
 # wandb stuff
-wandb_project = "wandb_vm_test"  # Project
-wandb_name = f"batch_size:{batch_size}"  # this will be the wandb run name
-wandb_experiment_name = "batch_size_exp1"  # currently using wandb "tags" for this
+wandb_project = "pythia-1b"  # Project
+wandb_name = f"ds_offload/stage:{ds_offload_summary}/{ds_dict['stage']}"  # this will be the wandb run name
+wandb_experiment_name = "deepspeed_exp2"  # currently using wandb "tags" for this
 
 
 class LightningGPTModule(L.LightningModule):
@@ -85,13 +101,20 @@ class LightningGPTModule(L.LightningModule):
         self.module.apply(self.module._init_weights)
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
-        return torch.optim.AdamW(
+        return ops.adam.DeepSpeedCPUAdam(
             self.module.parameters(),
             lr=learning_rate,
             weight_decay=weight_decay,
             betas=(beta1, beta2),
-            foreach=False,
         )
+
+        # return torch.optim.AdamW(
+        #     self.module.parameters(),
+        #     lr=learning_rate,
+        #     weight_decay=weight_decay,
+        #     betas=(beta1, beta2),
+        #     foreach=False,
+        # )
 
     def print_stats(self):
         self.print("*" * 100)
@@ -165,7 +188,7 @@ def main(
         strategy=train_params["lightning_strategy"],
         precision=train_params["precision"],
         logger=logger,
-        callbacks=[DeviceStatsMonitor()],
+        # callbacks=[DeviceStatsMonitor()],
         max_epochs=1,
         limit_val_batches=train_params["eval_batches"],
         accumulate_grad_batches=gradient_accumulation_steps,
