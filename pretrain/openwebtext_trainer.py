@@ -36,7 +36,7 @@ log_interval = 1
 train_bin_path = "/home/jpatel_theaiinstitute_com/dev/nanoGPT/data/openwebtext/train.bin"
 val_bin_path = "/home/jpatel_theaiinstitute_com/dev/nanoGPT/data/openwebtext/val.bin"
 
-max_steps = 1_000
+max_steps = 1000  # 1_000
 gradient_accumulation_steps = 1
 batch_size = 4
 
@@ -63,9 +63,9 @@ train_params = {
     "max_iters": max_iters,
     "total_training_examples": batch_size * max_steps,  # only informational, not used
     "eval_interval": 100,
-    "lightning_strategy": DeepSpeedStrategy(**ds_dict),
-    # "lightning_strategy": "ddp",
-    "devices": 8,
+    # "lightning_strategy": DeepSpeedStrategy(**ds_dict),
+    "lightning_strategy": "ddp",
+    "devices": 1,
     "precision": "16-mixed",
 }
 
@@ -82,9 +82,11 @@ min_lr = 6e-5
 lr_params = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
 
 # wandb stuff
-wandb_project = "pythia-1b"  # Project
-wandb_name = f"ds_offload/stage:{ds_offload_summary}/{ds_dict['stage']}"  # this will be the wandb run name
-wandb_experiment_name = "deepspeed_exp2"  # currently using wandb "tags" for this
+# wandb_project = "pythia-1b"  # Project
+wandb_project = "wandb_vm_test"  # Project
+# wandb_name = f"ds_offload/stage:{ds_offload_summary}/{ds_dict['stage']}"  # this will be the wandb run name
+wandb_name = "checkpoint1"
+wandb_experiment_name = "checkpoint_exp1"  # currently using wandb "tags" for this
 
 
 class LightningGPTModule(L.LightningModule):
@@ -101,20 +103,13 @@ class LightningGPTModule(L.LightningModule):
         self.module.apply(self.module._init_weights)
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
-        return ops.adam.DeepSpeedCPUAdam(
+        return torch.optim.AdamW(
             self.module.parameters(),
             lr=learning_rate,
             weight_decay=weight_decay,
             betas=(beta1, beta2),
+            foreach=False,
         )
-
-        # return torch.optim.AdamW(
-        #     self.module.parameters(),
-        #     lr=learning_rate,
-        #     weight_decay=weight_decay,
-        #     betas=(beta1, beta2),
-        #     foreach=False,
-        # )
 
     def print_stats(self):
         self.print("*" * 100)
@@ -180,6 +175,14 @@ def main(
 ) -> None:
     logger = WandbLogger(project=wandb_project, name=wandb_name, tags=[wandb_experiment_name])
 
+    # ModelCheckpoint callback
+    mc = ModelCheckpoint(
+        dirpath="./checkpoints",
+        filename="{step}",  # Use the step to name the checkpoint file
+        every_n_train_steps=100,  # Save a checkpoint every 10 training steps
+        save_top_k=-1,  # Set this to -1 to save all checkpoints. Be cautious as this could generate a lot of checkpoint files!
+    )
+
     trainer = L.Trainer(
         max_steps=max_steps,
         profiler="simple",
@@ -188,13 +191,14 @@ def main(
         strategy=train_params["lightning_strategy"],
         precision=train_params["precision"],
         logger=logger,
-        # callbacks=[DeviceStatsMonitor()],
+        callbacks=[mc],
         max_epochs=1,
         limit_val_batches=train_params["eval_batches"],
         accumulate_grad_batches=gradient_accumulation_steps,
         log_every_n_steps=log_interval,
         val_check_interval=train_params["eval_interval"],
         enable_model_summary=True,
+        enable_checkpointing=True,
     )
 
     L.seed_everything(1337, workers=True)  # same seed for every process to init model (FSDP)
@@ -210,7 +214,9 @@ def main(
     config = Config.from_name(model_name)
     trainer.print(f"Loading model with {config.__dict__}")
     t0 = time.time()
-    model = LightningGPTModule(config)
+    # model = LightningGPTModule(config)
+
+    model = LightningGPTModule.load_from_checkpoint("./checkpoints/step=500.ckpt", strict=True)
     trainer.print(f"Time to instantiate model: {time.time() - t0:.02f} seconds.")
 
     train_data = Dataset(train_bin_path, config.block_size)
@@ -220,7 +226,8 @@ def main(
 
     trainer.print("Calling trainer.fit...")
     t0 = time.time()
-    trainer.fit(model, train_dataloader, val_dataloader, ckpt_path="last")
+    trainer.fit(model, train_dataloader, val_dataloader)
+    # trainer.fit(model, train_dataloader, val_dataloader, ckpt_path="last")
     trainer.print(f"Training time: {(time.time()-t0):.2f}s")
 
 
