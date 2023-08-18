@@ -1,0 +1,11 @@
+# run with wandb sweep --project wandb_vm_test --name batchsize_lr_sweep2 sweep.yaml
+
+program: ./pretrain/openwebtext_trainer.py
+method: grid
+parameters:
+  learning_rate:
+    values: [6e-3, 6e-4, 6e-5]
+  batch_size:
+    values: [1, 2]
+metric:
+  name: val_loss

@@ -15,6 +15,7 @@ from lightning.pytorch.strategies import FSDPStrategy, XLAStrategy, DeepSpeedStr
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from lightning.pytorch.profilers import PyTorchProfiler
 from deepspeed import ops
+import wandb
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -36,9 +37,10 @@ log_interval = 1
 train_bin_path = "/home/jpatel_theaiinstitute_com/dev/nanoGPT/data/openwebtext/train.bin"
 val_bin_path = "/home/jpatel_theaiinstitute_com/dev/nanoGPT/data/openwebtext/val.bin"
 
-max_steps = 1000  # 1_000
+
+max_steps = 200  # 1_000
 gradient_accumulation_steps = 1
-batch_size = 4
+batch_size = 1
 
 ds_dict = {
     "stage": 3,
@@ -65,12 +67,13 @@ train_params = {
     "eval_interval": 100,
     # "lightning_strategy": DeepSpeedStrategy(**ds_dict),
     "lightning_strategy": "ddp",
-    "devices": 1,
+    "devices": 2,
     "precision": "16-mixed",
+    "learning_rate": 6e-4,
 }
 
 
-learning_rate = 6e-4
+# learning_rate = 6e-4
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -80,13 +83,6 @@ lr_decay_iters = max_iters
 min_lr = 6e-5
 
 lr_params = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
-
-# wandb stuff
-# wandb_project = "pythia-1b"  # Project
-wandb_project = "wandb_vm_test"  # Project
-# wandb_name = f"ds_offload/stage:{ds_offload_summary}/{ds_dict['stage']}"  # this will be the wandb run name
-wandb_name = "checkpoint1"
-wandb_experiment_name = "checkpoint_exp1"  # currently using wandb "tags" for this
 
 
 class LightningGPTModule(L.LightningModule):
@@ -105,7 +101,7 @@ class LightningGPTModule(L.LightningModule):
     def configure_optimizers(self) -> torch.optim.Optimizer:
         return torch.optim.AdamW(
             self.module.parameters(),
-            lr=learning_rate,
+            lr=train_params["learning_rate"],
             weight_decay=weight_decay,
             betas=(beta1, beta2),
             foreach=False,
@@ -143,7 +139,7 @@ class LightningGPTModule(L.LightningModule):
         if batch_idx == 0:
             self.print("training input_ids.shape", input_ids.shape, input_ids)
             self.print("training targets.shape", targets.shape, targets)
-            self.print_stats()
+            # self.print_stats()
 
         logits = self.module(input_ids)
         logits = logits.reshape(-1, logits.size(-1))
@@ -170,18 +166,15 @@ class LightningGPTModule(L.LightningModule):
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
 
 
-def main(
-    model_name="pythia-70m",
-) -> None:
-    logger = WandbLogger(project=wandb_project, name=wandb_name, tags=[wandb_experiment_name])
+def main(model_name="pythia-70m", batch_size=3, learning_rate=6e-4):
+    # print(run, dir(run))
+    print("batch_size", batch_size)
 
-    # ModelCheckpoint callback
-    mc = ModelCheckpoint(
-        dirpath="./checkpoints",
-        filename="{step}",  # Use the step to name the checkpoint file
-        every_n_train_steps=100,  # Save a checkpoint every 10 training steps
-        save_top_k=-1,  # Set this to -1 to save all checkpoints. Be cautious as this could generate a lot of checkpoint files!
-    )
+    # train_params = get_wandb_params()
+    train_params["batch_size"] = batch_size
+    train_params["learning_rate"] = learning_rate
+
+    logger = WandbLogger(name=f'bs-{batch_size},lr-{learning_rate}')
 
     trainer = L.Trainer(
         max_steps=max_steps,
@@ -191,14 +184,14 @@ def main(
         strategy=train_params["lightning_strategy"],
         precision=train_params["precision"],
         logger=logger,
-        callbacks=[mc],
+        callbacks=None,
         max_epochs=1,
         limit_val_batches=train_params["eval_batches"],
         accumulate_grad_batches=gradient_accumulation_steps,
         log_every_n_steps=log_interval,
         val_check_interval=train_params["eval_interval"],
         enable_model_summary=True,
-        enable_checkpointing=True,
+        # enable_checkpointing=True,
     )
 
     L.seed_everything(1337, workers=True)  # same seed for every process to init model (FSDP)
@@ -214,15 +207,14 @@ def main(
     config = Config.from_name(model_name)
     trainer.print(f"Loading model with {config.__dict__}")
     t0 = time.time()
-    # model = LightningGPTModule(config)
+    model = LightningGPTModule(config)
 
-    model = LightningGPTModule.load_from_checkpoint("./checkpoints/step=500.ckpt", strict=True)
     trainer.print(f"Time to instantiate model: {time.time() - t0:.02f} seconds.")
 
     train_data = Dataset(train_bin_path, config.block_size)
     val_data = Dataset(val_bin_path, config.block_size)
-    train_dataloader = DataLoader(train_data, batch_size=batch_size, num_workers=2)
-    val_dataloader = DataLoader(val_data, batch_size=batch_size, num_workers=2)
+    train_dataloader = DataLoader(train_data, batch_size=train_params["batch_size"], num_workers=2)
+    val_dataloader = DataLoader(val_data, batch_size=train_params["batch_size"], num_workers=2)
 
     trainer.print("Calling trainer.fit...")
     t0 = time.time()
@@ -250,7 +242,7 @@ class Dataset(IterableDataset):
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:
-        return learning_rate * it / warmup_iters
+        return train_params["learning_rate"] * it / warmup_iters
     # 2) if it > lr_decay_iters, return min learning rate
     if it > lr_decay_iters:
         return min_lr
@@ -258,7 +250,7 @@ def get_lr(it):
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1
-    return min_lr + coeff * (learning_rate - min_lr)
+    return min_lr + coeff * (train_params["learning_rate"] - min_lr)
 
 
 if __name__ == "__main__":
